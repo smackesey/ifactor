@@ -1,12 +1,20 @@
 local config = require('ifactor.config')
 local utils = require("ifactor.utils")
 
+--- @class IFactorInstance
+--- @field private initialized boolean
+--- @field public finished boolean
+--- @field private globs string[]
+--- @field private transform IFactorTransform
+--- @field private opts IFactorInstanceOpts
+--- @field private files string[]
+--- @field private file_statuses table<string, IFactorFileStatus>
+--- @field private file_index number
+--- @field private cursor IFactorCursor
 local Instance = {}
 Instance.__index = Instance
 
 Instance.COUNTER = 0
-
-local BUF_LOCAL_FILEPATH_VAR = "ifactor_filepath"
 
 function Instance:get_next_id()
   self.COUNTER = self.COUNTER + 1
@@ -16,28 +24,25 @@ end
 -- ****************************************************************************
 -- ***** CONSTRUCTION *********************************************************
 
+--- @param globs string|string[]
+--- @param transform IFactorTransform
+--- @param opts IFactorRawInstanceOpts|nil
 function Instance:new(globs, transform, opts)
   self.id = self:get_next_id()
-  opts = vim.tbl_deep_extend('force', config, opts or {})
-  opts.cwd = opts.cwd or vim.fn.getcwd()
-	globs = type(globs) == "string" and { globs } or globs
-	local obj = {
-		globs = globs,
-		transform = transform,
-		opts = opts,
-		initialized = false,
-		finished = false,
-	}
-	return setmetatable(obj, self)
+  opts = vim.tbl_deep_extend('force', config.instance, opts or {})
+  opts.cwd = opts.cwd == nil and vim.fn.getcwd() or opts.cwd
+  local obj = {
+    globs = globs,
+    transform = transform,
+    opts = opts,
+    initialized = false,
+    finished = false,
+  }
+  return setmetatable(obj, self)
 end
 
 -- ****************************************************************************
 -- ***** PUBLIC INTERFACE *****************************************************
-
-function Instance:quit()
-  self:destroy()
-  utils.printf("quit ifactor instance [%d]", self.id)
-end
 
 function Instance:accept()
   if self.finished then
@@ -51,19 +56,33 @@ function Instance:accept()
       self:notify("Accepted", "accept")
     end
     self:refresh_tracker()
-    self:step()
+    self:step(true)
   end
+end
+
+function Instance:quit()
+  self:destroy()
+  utils.printf("quit ifactor instance [%d]", self.id)
 end
 
 function Instance:reject()
   if self.finished then
     print("Cannot reject. Instance is finished.")
   else
-    self:restore()
+    self:restore('pre')
     self:increment_counter("reject")
     self:refresh_tracker()
     self:notify("Rejected", "reject")
-    self:step()
+    self:step(false)
+  end
+end
+
+function Instance:restore(snapshot_id)
+  if self.finished then
+    print("Cannot restore. Instance is finished.")
+  else
+    self:restore_snapshot(snapshot_id)
+    self:notify("Restored", "neutral")
   end
 end
 
@@ -75,84 +94,79 @@ function Instance:resume()
   end
 end
 
-function Instance:restore()
-  if self.finished then
-    print("Cannot restore. Instance is finished.")
-  else
-    self:restore_snapshot()
-    self:notify("Restored", "neutral")
-  end
-end
-
 -- ****************************************************************************
 -- ***** INITIALIZATION *******************************************************
 
 local resolve_globs
 
+--- @return boolean
 function Instance:initialize()
-	self.files = self:with_instance_cwd(function ()
+  self.files = self:with_instance_cwd(function()
     return resolve_globs(self.globs)
   end)
   self.file_statuses = {}
-	if #self.files == 0 then
-		utils.printf("No files found matching globs: %s", table.concat(self.globs, ", "))
-		self.initialized = true
-		self.finished = true
-		return false
-	else
-		self.file_index = 1
-		self.cursor = { line = 0, character = 0 }
-		self:create_dummy_buf()
-		self:create_keymap_buf()
-		self:create_tracker_buf()
-		self:create_ui()
-		self:setup_file()
-		self.initialized = true
-		return true
-	end
+  self.transform_iterator = utils.make_transform_iterator(self.transform)
+  if #self.files == 0 then
+    utils.printf("No files found matching globs: %s", table.concat(self.globs, ", "))
+    self.initialized = true
+    self.finished = true
+    return false
+  else
+    self.file_index = 1
+    self.cursor = { line = 0, character = 0 }
+    self:create_dummy_buf()
+    self:create_keymap_buf()
+    self:create_tracker_buf()
+    self:create_ui()
+    self:setup_file()
+    self.initialized = true
+    return true
+  end
 end
 
+--- @param globs string[]
+--- @return string[]
 function resolve_globs(globs)
-	local files = {}
-	for _, glob in ipairs(globs) do
-		for _, filepath in pairs(vim.fn.glob(glob, true, true)) do
+  local files = {}
+  for _, glob in ipairs(globs) do
+    for _, filepath in pairs(vim.fn.glob(glob, true, true)) do
       table.insert(files, filepath)
     end
-	end
-	return files
+  end
+  return files
 end
 
 -- ===== BUFFERS ==============================================================
 
 function Instance:create_dummy_buf()
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
   vim.api.nvim_buf_set_name(buf, string.format("ifactor-dummy-%d", self.id))
-	vim.api.nvim_buf_set_option(buf, "modifiable", false)
+  vim.api.nvim_buf_set_option(buf, "modifiable", false)
   self:apply_buf_keymaps(buf)
-	self.dummy_buf = buf
+  self.dummy_buf = buf
 end
 
 -- TODO: Make sure I can still modify with code
 function Instance:create_tracker_buf()
-	local buf = vim.api.nvim_create_buf(false, true)
-	vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
-	vim.api.nvim_buf_set_option(buf, "filetype", 'ifactortracker')
-	vim.api.nvim_buf_set_option(buf, "modifiable", false)
+  local buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+  vim.api.nvim_buf_set_option(buf, "language", 'ifactortracker')
+  vim.api.nvim_buf_set_option(buf, "modifiable", false)
   self:apply_buf_keymaps(buf)
-	self.tracker_buf = buf
+  self.tracker_buf = buf
 end
 
 function Instance:create_keymap_buf()
-	local buf = vim.api.nvim_create_buf(false, false)
-	local lines = vim.tbl_map(function(k)
-		return vim.fn.printf("  %-10s %s", self.opts.mappings[k], k)
-	end, vim.tbl_keys(self.opts.mappings))
+  local buf = vim.api.nvim_create_buf(false, false)
+  local lines = vim.tbl_map(function(k)
+    return vim.fn.printf("  %-10s %s", self.opts.mappings[k], k)
+  end, vim.tbl_keys(self.opts.mappings))
   table.sort(lines)
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-	vim.api.nvim_buf_set_option(buf, "modifiable", false)
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_option(buf, "modifiable", false)
   self:apply_buf_keymaps(buf)
-	self.keymap_buf = buf
+  self.keymap_buf = buf
 end
 
 -- ===== UI ===================================================================
@@ -160,68 +174,61 @@ end
 local setup_window_diff
 
 function Instance:create_ui()
-	self.ui = {}
-	vim.cmd(string.format("tabedit %s", vim.api.nvim_buf_get_name(self.dummy_buf)))
-	self.tab = vim.api.nvim_get_current_tabpage()
+  self.ui = {}
+  vim.cmd(string.format("tabedit %s", vim.api.nvim_buf_get_name(self.dummy_buf)))
+  self.tab = vim.api.nvim_get_current_tabpage()
   self:init_tracker_win()
-	vim.cmd("vsplit")
+  vim.cmd("vsplit")
   self:init_work_win()
-	vim.cmd("vsplit")
+  vim.cmd("vsplit")
   self:init_source_win()
-	vim.fn.win_gotoid(self.tracker_win)
-	vim.cmd("split")
+  vim.fn.win_gotoid(self.tracker_win)
+  vim.cmd("split")
   self:init_notification_win()
   vim.cmd('split')
   self:init_keymap_win()
-	vim.api.nvim_win_set_height(self.keymap_win, 5)
+  vim.api.nvim_win_set_height(self.keymap_win, 5)
   -- notification and keymap wins are 5 lines each, 1 tab line, 3 status lines
-  local tracker_height =  (vim.api.nvim_get_option("lines") -
-    vim.api.nvim_get_option('cmdheight') - (2 * 5) - 3 - 1)
-	vim.api.nvim_win_set_height(self.tracker_win, tracker_height)
+  local tracker_height = (vim.api.nvim_get_option("lines") -
+      vim.api.nvim_get_option('cmdheight') - (2 * 5) - 3 - 1)
+  vim.api.nvim_win_set_height(self.tracker_win, tracker_height)
   vim.fn.win_gotoid(self.work_win)
 end
 
 function Instance:init_tracker_win()
-	local win = vim.fn.win_getid()
+  local win = vim.fn.win_getid()
   vim.api.nvim_win_set_option(win, "number", false)
   vim.api.nvim_win_set_option(win, "signcolumn", 'no')
-	vim.api.nvim_win_set_buf(win, self.tracker_buf)
-	self.tracker_win = win
+  vim.api.nvim_win_set_buf(win, self.tracker_buf)
+  self.tracker_win = win
 end
 
 function Instance:init_work_win()
-	local win = vim.fn.win_getid()
-	vim.api.nvim_win_set_buf(win, self.dummy_buf)
-	self.work_win = win
+  local win = vim.fn.win_getid()
+  vim.api.nvim_win_set_buf(win, self.dummy_buf)
+  self.work_win = win
 end
 
 function Instance:init_source_win()
-	local win = vim.fn.win_getid()
-	vim.api.nvim_win_set_buf(win, self.dummy_buf)
-	self.source_win = win
+  local win = vim.fn.win_getid()
+  vim.api.nvim_win_set_buf(win, self.dummy_buf)
+  self.source_win = win
 end
 
 function Instance:init_notification_win()
   local win = vim.fn.win_getid()
-	vim.api.nvim_win_set_buf(win, self.dummy_buf)
+  vim.api.nvim_win_set_buf(win, self.dummy_buf)
   vim.api.nvim_win_set_option(win, "number", false)
   vim.api.nvim_win_set_option(win, "signcolumn", 'no')
-	self.notification_win = win
+  self.notification_win = win
 end
 
 function Instance:init_keymap_win()
   local win = vim.fn.win_getid()
-	vim.api.nvim_win_set_buf(0, self.keymap_buf)
+  vim.api.nvim_win_set_buf(0, self.keymap_buf)
   vim.api.nvim_win_set_option(win, "number", false)
   vim.api.nvim_win_set_option(win, "signcolumn", 'no')
-	self.keymap_win = win
-end
-
-function setup_window_diff(win)
-	vim.api.nvim_win_set_option(win, "diff", true)
-	vim.api.nvim_win_set_option(win, "scrollbind", true)
-	vim.api.nvim_win_set_option(win, "cursorbind", true)
-	vim.api.nvim_win_set_option(win, "foldenable", false)
+  self.keymap_win = win
 end
 
 -- ****************************************************************************
@@ -244,12 +251,12 @@ function Instance:destroy()
   end
 
   -- ----- BUFFERS
-	try_delete_buffer(self.dummy_buf)
-	try_delete_buffer(self.tracker_buf)
-	try_delete_buffer(self.work_buf)
-	if not self.file_was_open then
-		try_delete_buffer(self.source_buf)
-	end
+  try_delete_buffer(self.dummy_buf)
+  try_delete_buffer(self.tracker_buf)
+  try_delete_buffer(self.work_buf)
+  if not self.file_was_open then
+    try_delete_buffer(self.source_buf)
+  end
 
   -- LUA
   require('ifactor').ACTIVE_INSTANCE = nil
@@ -268,44 +275,72 @@ function is_floating_win(win)
 end
 
 function try_delete_buffer(buf)
-	if buf ~= nil and vim.api.nvim_buf_is_valid(buf) then
-		vim.api.nvim_buf_delete(buf, { force = true })
-	end
+  if buf ~= nil and vim.api.nvim_buf_is_valid(buf) then
+    vim.api.nvim_buf_delete(buf, { force = true })
+  end
 end
 
 function try_delete_window(win)
-	if win ~= nil and vim.api.nvim_win_is_valid(win) then
-		vim.api.nvim_win_close(win, true)
-	end
+  if win ~= nil and vim.api.nvim_win_is_valid(win) then
+    vim.api.nvim_win_close(win, true)
+  end
 end
 
 -- ****************************************************************************
 -- ***** STEP *****************************************************************
 
-function Instance:step()
-	if not self.initialized then
-		self:initialize()
-	elseif self.finished then
-		utils.printf("Cannot step. Instance is finished.")
-		return
-	end
+local get_diff_start_position
+
+function Instance:step(dirty)
+  if not self.initialized then
+    self:initialize()
+  elseif self.finished then
+    utils.printf("Cannot step. Instance is finished.")
+    return
+  end
 
   if not self:file_loaded() then
     self:setup_file()
   end
 
-	-- diff is a list of LSP TextEdit objects
+  -- diff is a list of LSP TextEdit objects
   self:update_snapshot('pre')
-	local ok, diff_or_err, next_cursor_pos = pcall(self.transform, self, self.work_buf, self.cursor)
+  local ok, cursor_pos_or_err, diff = xpcall(self.transform_iterator, debug.traceback, self.work_buf, self.cursor, dirty)
+
   if not ok then
     self:restore_snapshot('pre')
-    self:handle_error(diff_or_err)
-  elseif diff_or_err then
-    local diff = diff_or_err
-    vim.lsp.util.apply_text_edits(diff, self.work_buf)
-    self.cursor = next_cursor_pos
-  else
+    self:handle_error(cursor_pos_or_err)
+  elseif diff == nil then
     self:next_file()
+  else
+    vim.lsp.util.apply_text_edits(diff, self.work_buf, 'utf8')
+    self:update_snapshot('post')
+    local diff_start_pos = get_diff_start_position(diff)
+    vim.api.nvim_win_set_cursor(self.work_win, diff_start_pos)
+    vim.api.nvim_win_call(self.work_win, function()
+      vim.fn.winrestview({ topline = diff_start_pos[1] })
+    end)
+    self:enable_lsp_for_buf(self.source_buf)
+    self.cursor = cursor_pos_or_err
+  end
+end
+
+function get_diff_start_position(diff)
+  local first_edit = diff[1]
+  local line, col = first_edit.range.start.line + 1, first_edit.range.start.character
+  return { line, col }
+end
+
+function Instance:enable_lsp_for_buf(buf)
+  local buf_name = vim.api.nvim_buf_get_name(buf)
+  local clients = vim.tbl_filter(function(client)
+    -- print('%s == %s', self.opts.cwd, client.config.root_dir)
+    return self.opts.cwd == client.config.root_dir and
+        vim.tbl_contains(client.config.languages, vim.api.nvim_buf_get_option(buf, 'language'))
+  end, vim.lsp.get_active_clients())
+  -- printf("Found %d clients", #clients)
+  for _, client in ipairs(clients) do
+    vim.lsp.buf_attach_client(buf, client.id)
   end
 end
 
@@ -342,33 +377,42 @@ end
 local load_file
 
 function Instance:setup_file()
-	local filepath = self.files[self.file_index]
-	self:create_source_buf(filepath)
-	vim.api.nvim_win_set_buf(self.source_win, self.source_buf)
-  vim.api.nvim_win_call(self.source_win, function () vim.cmd('diffthis') end)
-	self:create_work_buf(self.source_buf)
-	vim.api.nvim_win_set_buf(self.work_win, self.work_buf)
-  vim.api.nvim_win_call(self.work_win, function () vim.cmd('diffthis') end)
+  vim.cmd('diffoff!')
+  local filepath = self.files[self.file_index]
+  self:create_source_buf(filepath)
+  vim.api.nvim_win_set_buf(self.source_win, self.source_buf)
+  vim.api.nvim_win_call(self.source_win, function() setup_window_diff(self.source_win) end)
+  self:create_work_buf(self.source_buf)
+  vim.api.nvim_win_set_buf(self.work_win, self.work_buf)
+  vim.api.nvim_win_call(self.work_win, function() setup_window_diff(self.work_win) end)
   self:reset_ledger()
   self.file_statuses[self.file_index] = 'unmodified'
   self:refresh_tracker()
 end
 
+function setup_window_diff(win)
+  vim.cmd('diffthis')
+  vim.api.nvim_win_set_option(win, "scrollbind", true)
+  vim.api.nvim_win_set_option(win, "cursorbind", true)
+  vim.api.nvim_win_set_option(win, "foldmethod", 'manual')
+  vim.api.nvim_win_set_option(win, "foldenable", false)
+end
+
 function Instance:create_source_buf(filepath)
   local buf
-	if vim.fn.bufexists(filepath) == 1 then
-		buf = vim.fn.bufnr(filepath)
-		if vim.api.nvim_buf_get_option(buf, "modified") == 1 then
-			error(string.format("File %s is open and modified. Save file and then call `ifactor.resume()`.", filepath))
-		else
-			self.file_was_open = true
-		end
-	else
-		buf = self:with_instance_cwd(function ()
+  if vim.fn.bufexists(filepath) == 1 then
+    buf = vim.fn.bufnr(filepath)
+    if vim.api.nvim_buf_get_option(buf, "modified") == 1 then
+      error(string.format("File %s is open and modified. Save file and then call `ifactor.resume()`.", filepath))
+    else
+      self.file_was_open = true
+    end
+  else
+    buf = self:with_instance_cwd(function()
       return load_file(filepath)
     end)
-		self.file_was_open = false
-	end
+    self.file_was_open = false
+  end
   vim.api.nvim_buf_set_option(buf, 'modifiable', false)
   self.source_buf = buf
 end
@@ -377,56 +421,69 @@ function load_file(filepath)
   local buf = vim.api.nvim_create_buf(false, false)
   local lines = vim.fn.readfile(filepath)
   vim.api.nvim_buf_set_lines(buf, 0, -1, true, lines)
+  vim.api.nvim_buf_set_option(buf, 'buftype', 'nofile') -- prevents LSP from launching
   vim.api.nvim_buf_set_name(buf, filepath)
   vim.api.nvim_buf_set_option(buf, 'modified', false)
   vim.api.nvim_buf_call(buf, function()
-    vim.cmd('filetype detect')
+    vim.cmd('language detect')
   end)
   return buf
 end
 
 function Instance:create_work_buf(source_buf)
-	local lines = vim.api.nvim_buf_get_lines(source_buf, 0, -1, false)
-	local buf = vim.api.nvim_create_buf(false, false)
-	vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
-	vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
-  vim.api.nvim_buf_set_option(buf, 'filetype', vim.api.nvim_buf_get_option(source_buf, 'filetype'))
-	-- vim.api.nvim_buf_set_var(buf, BUF_LOCAL_FILEPATH_VAR, vim.api.nvim_buf_get_name(source_buf))
+  local lines = vim.api.nvim_buf_get_lines(source_buf, 0, -1, false)
+  local buf = vim.api.nvim_create_buf(false, false)
+  vim.api.nvim_buf_set_option(buf, "buftype", "nofile")
+  local filepath = self:with_instance_cwd(function()
+    -- Use bufname() here instead of nvim_buf_get_name so we can get relative path
+    return vim.fn.bufname(source_buf)
+  end)
+  vim.api.nvim_buf_set_name(buf, string.format('ifactor://%s', filepath))
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_option(buf, 'language', vim.api.nvim_buf_get_option(source_buf, 'language'))
   self:apply_buf_keymaps(buf)
-	self.work_buf = buf
+  self.work_buf = buf
 end
 
 function Instance:reset_ledger()
-	self.ledger = { accept = 0, modify = 0, reject = 0 }
+  self.ledger = { accept = 0, modify = 0, reject = 0 }
 end
 
 -- ****************************************************************************
 -- ***** TEARDOWN FILE ********************************************************
 
 function Instance:teardown_file()
-	if self:file_has_changes() and not self.opts.dry_run then
-		self:save_changes()
+  if self:file_has_changes() and not self.opts.dry_run then
+    self:save_changes()
     self.file_statuses[self.file_index] = 'modified'
   end
-	vim.api.nvim_win_set_buf(self.work_win, self.dummy_buf)
-	vim.api.nvim_win_set_buf(self.source_win, self.dummy_buf)
-	vim.api.nvim_buf_delete(self.work_buf, {force = self.opts.dry_run})
-	if not self.file_was_open then
-		vim.api.nvim_buf_delete(self.source_buf, {})
-	end
-	self.snapshot = nil
-	self.ledger = nil
-	self.work_buf = nil
-	self.source_buf = nil
-	self.file_was_open = nil
+  vim.api.nvim_win_set_buf(self.work_win, self.dummy_buf)
+  vim.api.nvim_win_set_buf(self.source_win, self.dummy_buf)
+  vim.api.nvim_buf_delete(self.work_buf, { force = self.opts.dry_run })
+  if not self.file_was_open then
+    vim.api.nvim_buf_delete(self.source_buf, {})
+  end
+  self.snapshot_pre = nil
+  self.snapshot_post = nil
+  self.ledger = nil
+  self.work_buf = nil
+  self.source_buf = nil
+  self.file_was_open = nil
 end
 
 function Instance:save_changes()
-	local lines = vim.api.nvim_buf_get_lines(self.work_buf, 0, -1, false)
-	vim.api.nvim_buf_set_lines(self.source_buf, 0, -1, false, lines)
-	vim.api.nvim_buf_call(self.source_buf, function()
-		vim.cmd("update")
-	end)
+  local lines = vim.api.nvim_buf_get_lines(self.work_buf, 0, -1, false)
+  vim.api.nvim_buf_set_option(self.source_buf, 'modifiable', true)
+  vim.api.nvim_buf_set_lines(self.source_buf, 0, -1, false, lines)
+  if self.file_was_open then
+    vim.api.nvim_buf_call(self.source_buf, function()
+      vim.cmd("update")
+    end)
+  else
+    self:with_instance_cwd(function()
+      vim.fn.writefile(lines, self.files[self.file_index])
+    end)
+  end
 end
 
 -- ****************************************************************************
@@ -470,7 +527,7 @@ function Instance:file_loaded()
 end
 
 function Instance:file_has_changes()
-	return self.ledger.accept > 0 or self.ledger.modify > 0
+  return self.ledger.accept > 0 or self.ledger.modify > 0
 end
 
 function Instance:has_next_file()
@@ -481,11 +538,11 @@ end
 -- ***** FEEDBACK *************************************************************
 
 function Instance:notify(msg, style, time)
-  time = time ~=0 and (time or 1000) or nil  -- time == 0 means no timeout
+  time = time ~= 0 and (time or 1000) or nil -- time == 0 means no timeout
   local win_width = vim.api.nvim_win_get_width(self.notification_win)
   local pos = vim.api.nvim_win_get_position(self.notification_win)
   local win_row, win_col = pos[1], pos[2]
-  local popup_width = #msg + 4  -- padding + border
+  local popup_width = #msg + 4 -- padding + border
   local line = win_row + 3
   local col = win_col + math.floor(win_width / 2) - math.floor(popup_width / 2)
   vim.fn.win_gotoid(self.notification_win)
@@ -496,10 +553,10 @@ function Instance:notify(msg, style, time)
     col = col,
     width = #msg,
     border = {},
-    highlight = self.opts.highlights[style],
-    borderhighlight = self.opts.highlights[style],
+    highlight = config.highlights[style],
+    borderhighlight = config.highlights[style],
     time = time,
-    padding = {0, 2, 0, 2},
+    padding = { 0, 2, 0, 2 },
   })
   vim.api.nvim_win_set_option(win, 'diff', false)
   vim.fn.win_gotoid(self.work_win)
@@ -518,18 +575,18 @@ local STATUS_ICONS = {
 }
 
 function Instance:refresh_tracker()
-	local filepath = self.files[self.file_index]
+  local filepath = self.files[self.file_index]
   local status = self.file_statuses[self.file_index]
-	local ledger_str = string.format("(%d/%d/%d)",
+  local ledger_str = string.format("(%d/%d/%d)",
     self.ledger.accept, self.ledger.modify, self.ledger.reject)
-	local line = string.format("  %s %s %s", STATUS_ICONS[status], ledger_str, filepath)
+  local line = string.format("  %s %s %s", STATUS_ICONS[status], ledger_str, filepath)
   local curr_line = vim.api.nvim_buf_get_lines(self.tracker_buf, 0, 1, false)[1]
   local curr_filepath = curr_line and vim.fn.split(curr_line, " ")[3] or filepath
   vim.api.nvim_buf_set_option(self.tracker_buf, "modifiable", true)
   if curr_filepath == filepath then
-    vim.api.nvim_buf_set_lines(self.tracker_buf, 0, 1, false, {line})
+    vim.api.nvim_buf_set_lines(self.tracker_buf, 0, 1, false, { line })
   else
-    vim.api.nvim_buf_set_lines(self.tracker_buf, 0, 1, false, {line, curr_line})
+    vim.api.nvim_buf_set_lines(self.tracker_buf, 0, 1, false, { line, curr_line })
   end
   vim.api.nvim_buf_set_option(self.tracker_buf, "modifiable", false)
 end
@@ -538,27 +595,23 @@ end
 -- ***** OTHER ****************************************************************
 
 function Instance:with_instance_cwd(fn)
-  local curr_cwd = vim.fn.getcwd()
-  vim.cmd(string.format('cd %s', self.opts.cwd))
-  local result = fn()
-  vim.cmd(string.format('cd %s', curr_cwd))
-  return result
+  return utils.with_cwd(self.opts.cwd, fn)
 end
 
 function Instance:increment_counter(counter)
-	self.ledger[counter] = self.ledger[counter] + 1
+  self.ledger[counter] = self.ledger[counter] + 1
 end
 
 function Instance:apply_buf_keymaps(buf)
-	for cmd, lhs in pairs(self.opts.mappings) do
-		vim.api.nvim_buf_set_keymap(
-			buf,
-			"n",
-			lhs,
-			string.format('<cmd>lua require("ifactor").%s()<CR>', cmd),
-			{ noremap = true }
-		)
-	end
+  for cmd, lhs in pairs(self.opts.mappings) do
+    vim.api.nvim_buf_set_keymap(
+      buf,
+      "n",
+      lhs,
+      string.format('<cmd>lua require("ifactor").%s()<CR>', cmd),
+      { noremap = true }
+    )
+  end
 end
 
 return Instance

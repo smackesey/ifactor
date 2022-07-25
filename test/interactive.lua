@@ -30,7 +30,7 @@ local QUERY = [[
 
 
 -- prefix any discovered functions
-local transform = utils.make_treesitter_query_transform(QUERY, 'python', function (buf, caps)
+local transform = utils.make_query_transform_iterator(QUERY, 'python', function (buf, caps)
   local replacement_text = 'foo_' .. vim.treesitter.query.get_node_text(caps.funcname, buf)
   return {
     utils.get_diff_replace_node(caps.funcname, replacement_text)

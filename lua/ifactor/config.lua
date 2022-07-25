@@ -1,7 +1,16 @@
 local m = {}
 
 local DEFAULT_CONFIG = {
-  dry_run = false,
+  instance = {
+    dry_run = false,
+    mappings = {
+      quit = "<F5><F2>",
+      reject = "<F5><F3>",
+      accept = "<F5><F4>",
+      restore_pre = "<F5><F5>",
+      restore_post = "<F5><F6>",
+    },
+  },
   highlights = {
     accept = 'Function',  -- green
     accept_with_modification = 'Identifier',  -- blue
@@ -10,12 +19,8 @@ local DEFAULT_CONFIG = {
     finish = 'Boolean',  -- purple
     restore = 'Boolean',  -- purple
   },
-  mappings = {
-    reject = "<F5><F3>",
-    accept = "<F5><F4>",
-    restore = "<F5><F5>",
-    quit = "<F5><F2>",
-  },
+  transform_path = {},
+  glob_aliases = {},
 }
 
 local meta = {
